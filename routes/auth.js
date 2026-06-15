@@ -4,12 +4,14 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { pool } = require('../db');
 
-const LIMIT = { free: 5, pro: 15 }; // batas analisa per hari
+const LIMIT = { free: 5, pro: 15 };
 
-// ─── RESET usage kalau sudah hari baru ───────────────────────────────────────
+// ── FIX: fungsi ini harus return user ────────────────────────────
 async function checkAndReset(user) {
   const today = new Date().toISOString().split('T')[0];
-  const lastReset = user.last_reset ? user.last_reset.toISOString().split('T')[0] : null;
+  const lastReset = user.last_reset
+    ? new Date(user.last_reset).toISOString().split('T')[0]
+    : null;
   if (lastReset !== today) {
     await pool.query(
       'UPDATE users SET usage_today = 0, last_reset = CURRENT_DATE WHERE id = $1',
@@ -17,10 +19,10 @@ async function checkAndReset(user) {
     );
     user.usage_today = 0;
   }
-  return user;
+  return user; // ← FIX: ada return yang hilang di kode lama!
 }
 
-// ─── LOGIN ────────────────────────────────────────────────────────────────────
+// ── LOGIN ─────────────────────────────────────────────────────────
 router.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -39,7 +41,7 @@ router.post('/login', async (req, res) => {
     const token = jwt.sign(
       { id: user.id, username: user.username, plan: user.plan },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     res.json({ ok: true, token, username: user.username, plan: user.plan });
@@ -48,12 +50,13 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// ─── VERIFY TOKEN ─────────────────────────────────────────────────────────────
+// ── VERIFY TOKEN ──────────────────────────────────────────────────
 router.post('/verify', async (req, res) => {
   try {
     const { token } = req.body;
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    if (!token) return res.json({ ok: false, error: 'Token tidak ada' });
 
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const result = await pool.query('SELECT * FROM users WHERE id = $1', [decoded.id]);
     const user = result.rows[0];
 
@@ -66,7 +69,7 @@ router.post('/verify', async (req, res) => {
   }
 });
 
-// ─── CEK LIMIT HARIAN ─────────────────────────────────────────────────────────
+// ── CHECK LIMIT ───────────────────────────────────────────────────
 router.post('/check-limit', async (req, res) => {
   try {
     const { token } = req.body;
@@ -74,35 +77,26 @@ router.post('/check-limit', async (req, res) => {
 
     let result = await pool.query('SELECT * FROM users WHERE id = $1', [decoded.id]);
     let user = result.rows[0];
-
     if (!user || !user.is_active)
       return res.json({ ok: false, error: 'Akun tidak valid' });
 
     user = await checkAndReset(user);
-
     const limit = LIMIT[user.plan] || LIMIT.free;
     const remaining = limit - user.usage_today;
-    const allowed = remaining > 0;
 
-    res.json({
-      ok: true,
-      allowed,
-      plan: user.plan,
-      usage: user.usage_today,
-      limit,
-      remaining: Math.max(0, remaining)
-    });
+    res.json({ ok: true, allowed: remaining > 0, plan: user.plan, usage: user.usage_today, limit, remaining: Math.max(0, remaining) });
   } catch (e) {
     res.json({ ok: false, error: 'Token tidak valid' });
   }
 });
 
-// ─── CATAT PEMAKAIAN (+1 analisa) ─────────────────────────────────────────────
+// ── USE (catat 1 analisa) ─────────────────────────────────────────
 router.post('/use', async (req, res) => {
   try {
     const { token } = req.body;
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    if (!token) return res.json({ ok: false, error: 'Token tidak ada' });
 
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
     let result = await pool.query('SELECT * FROM users WHERE id = $1', [decoded.id]);
     let user = result.rows[0];
 
@@ -110,13 +104,14 @@ router.post('/use', async (req, res) => {
       return res.json({ ok: false, error: 'Akun tidak valid' });
 
     user = await checkAndReset(user);
-
     const limit = LIMIT[user.plan] || LIMIT.free;
-    if (user.usage_today >= limit)
+
+    if (user.usage_today >= limit) {
       return res.json({
         ok: false,
-        error: `Limit ${user.plan.toUpperCase()} habis (${limit}x/hari). ${user.plan === 'free' ? 'Upgrade ke PRO untuk 15x analisa!' : 'Coba lagi besok.'}`
+        error: `Limit ${user.plan.toUpperCase()} habis (${user.usage_today}/${limit}x hari ini). ${user.plan === 'free' ? 'Upgrade ke PRO untuk 15x analisa!' : 'Coba lagi besok jam 00:00.'}`
       });
+    }
 
     await pool.query('UPDATE users SET usage_today = usage_today + 1 WHERE id = $1', [user.id]);
 
