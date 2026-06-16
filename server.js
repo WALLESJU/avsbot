@@ -176,14 +176,22 @@ app.post('/bot/signal', async (req, res) => {
     const maxStr    = String(maxExpiry.getHours()).padStart(2,'0') + ':' + String(maxExpiry.getMinutes()).padStart(2,'0');
     const data      = fmtC(c15m, 'TF 15m') + fmtC(c5m, 'TF 5m') + fmtC(c1m, 'TF 1m');
     const nowStr    = now.toLocaleTimeString('id-ID');
-    const prompt    = 'Kamu AI scalper binary option EURUSD. Jam WIB: ' + nowStr + '\n' + data + '\nPilih expiry terbaik antara ' + minStr + ' sd ' + maxStr + ' (format HH:MM, menit bulat WIB) berdasarkan momentum dan SR.\nBalas JSON: {signal:BUY/SELL/SKIP,confidence:75,trend15m:BULLISH/BEARISH/SIDEWAYS,smartmoney:true,expiry:' + minStr + ',reasonopen:alasan max100char,reasonexpiry:alasan expiry max80char,entryprice:1.15780}';
+    const sysMsg  = 'You are a binary option trading signal AI. ALWAYS respond with valid JSON only. No explanation, no markdown, no extra text. Required keys: signal, confidence, trend15m, smartmoney, expiry, reasonopen, reasonexpiry, entryprice';
+    const userMsg = 'Data EURUSD jam WIB ' + nowStr + ':\n' + data +
+      '\nExpiry terbaik antara ' + minStr + ' sd ' + maxStr + ' (HH:MM WIB, menit bulat).\n' +
+      'Balas HANYA JSON:\n{"signal":"BUY","confidence":75,"trend15m":"BULLISH",' +
+      '"smartmoney":true,"expiry":"' + minStr + '","reasonopen":"alasan<100chr",' +
+      '"reasonexpiry":"alasan expiry<80chr","entryprice":1.15780}';
 
     // Call GPT menggunakan https bawaan (tanpa axios)
     const gptResult = await new Promise((resolve, reject) => {
       const body = JSON.stringify({
         model: OPENAI_MODEL,
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 220,
+        messages: [
+          { role: 'system', content: sysMsg },
+          { role: 'user',   content: userMsg }
+        ],
+        max_tokens: 300,
         temperature: 0.3
       });
       const urlObj = new URL(OPENAI_URL);
@@ -209,8 +217,12 @@ app.post('/bot/signal', async (req, res) => {
       reqHttp.end();
     });
 
-    const raw = gptResult.choices[0].message.content.trim().replace(/```json|```/g, '').trim();
-    const gpt = JSON.parse(raw);
+    let raw = gptResult.choices[0].message.content.trim();
+    raw = raw.replace(/```json|```/gi, '').trim();
+    // Ekstrak JSON object pertama dari respons
+    const jm = raw.match(/\{[\s\S]*\}/);
+    if (!jm) throw new Error('GPT tidak return JSON valid: ' + raw.substring(0,80));
+    const gpt = JSON.parse(jm[0]);
     // Validasi expiry dari GPT - harus format HH:MM dan >= menit berikutnya
     const gpExp   = (gpt.expiry || '').trim();
     const validFmt = /^\d{2}:\d{2}$/.test(gpExp);
