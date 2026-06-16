@@ -169,8 +169,11 @@ app.post('/bot/signal', async (req, res) => {
     }
 
     const now       = new Date();
-    const target    = new Date(now.getTime() + EXPMIN * 60 * 1000);
-    const expiryStr = String(target.getHours()).padStart(2,'0') + ':' + String(target.getMinutes()).padStart(2,'0');
+    // Hitung range expiry WIB: menit bulat berikutnya s/d +5 menit
+    const nextMin   = new Date(Math.ceil((now.getTime() + 30000) / 60000) * 60000);
+    const maxExpiry = new Date(nextMin.getTime() + 4 * 60000);
+    const minStr    = String(nextMin.getHours()).padStart(2,'0') + ':' + String(nextMin.getMinutes()).padStart(2,'0');
+    const maxStr    = String(maxExpiry.getHours()).padStart(2,'0') + ':' + String(maxExpiry.getMinutes()).padStart(2,'0');
     const data      = fmtC(c15m, 'TF 15m') + fmtC(c5m, 'TF 5m') + fmtC(c1m, 'TF 1m');
     const nowStr    = now.toLocaleTimeString('id-ID');
     const prompt    = 'Kamu AI scalper binary option EURUSD. Jam WIB: ' + nowStr + '\n' + data + '\nPilih expiry terbaik antara ' + minStr + ' sd ' + maxStr + ' (format HH:MM, menit bulat WIB) berdasarkan momentum dan SR.\nBalas JSON: {signal:BUY/SELL/SKIP,confidence:75,trend15m:BULLISH/BEARISH/SIDEWAYS,smartmoney:true,expiry:' + minStr + ',reasonopen:alasan max100char,reasonexpiry:alasan expiry max80char,entryprice:1.15780}';
