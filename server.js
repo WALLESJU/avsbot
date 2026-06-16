@@ -26,7 +26,7 @@ function resetIfNewDay(user) {
   }
 }
 
-const PLAN_LIMIT = { free: 5, pro: 50 };
+const PLAN_LIMIT = { free: 10, pro: 30 };
 
 // ── MIDDLEWARE ADMIN AUTH ────────────────────────────────────────
 function adminAuth(req, res, next) {
