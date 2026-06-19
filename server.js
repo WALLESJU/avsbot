@@ -10,8 +10,8 @@ const PORT = process.env.PORT || 3000;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'Bismilah2026';
 const JWT_SECRET = process.env.JWT_SECRET || 'avsgpt2026rahasia123';
 const OPENAI_URL = process.env.OPENAI_URL || 'https://lite.koboillm.com/v1/chat/completions';
-const OPENAI_KEY = process.env.OPENAI_KEY || 'a99e7352827544e28063d1227ef76a4a';
-const TWELVE_KEY = process.env.TWELVE_KEY || 'sk-bbcQ_tgzKrXpMRTPXrxHvg';
+const OPENAI_KEY = process.env.OPENAI_KEY || 'sk-bbcQ_tgzKrXpMRTPXrxHvg';
+const TWELVE_KEY = process.env.TWELVE_KEY || 'a99e7352827544e28063d1227ef76a4a';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'openai/gpt-4o-mini';
 
 app.use(cors({
