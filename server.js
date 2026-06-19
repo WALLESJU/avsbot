@@ -13,6 +13,9 @@ const OPENAI_URL = process.env.OPENAI_URL || 'https://lite.koboillm.com/v1/chat/
 const OPENAI_KEY = process.env.OPENAI_KEY || 'sk-bbcQ_tgzKrXpMRTPXrxHvg';
 const TWELVE_KEY = process.env.TWELVE_KEY || 'a99e7352827544e28063d1227ef76a4a';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'openai/gpt-4o-mini';
+const ANALYSIS_COOLDOWN_MS = 3 * 60 * 1000;
+const SNAPSHOT_CANDLES = 30;
+const CACHE_TTL_MS = 45 * 1000;
 
 app.use(cors({
   origin: '*',
@@ -23,6 +26,8 @@ app.use(express.json({ limit: '1mb' }));
 
 let users = {};
 const PLAN_LIMIT = { free: 10, pro: 30 };
+const marketCache = new Map();
+const analysisState = new Map();
 
 function resetIfNewDay(user) {
   const today = new Date().toDateString();
@@ -59,11 +64,8 @@ function fetchJson(url, timeout = 15000) {
       let data = '';
       r.on('data', d => data += d);
       r.on('end', () => {
-        try {
-          resolve(JSON.parse(data));
-        } catch (e) {
-          reject(e);
-        }
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(e); }
       });
     });
     req.on('error', reject);
@@ -77,6 +79,7 @@ async function fetchCandle(symbol, interval, size) {
   if (json.status === 'error') throw new Error('TwelveData: ' + json.message);
   if (!Array.isArray(json.values) || !json.values.length) throw new Error('TwelveData kosong');
   return json.values.map(v => ({
+    dt: v.datetime,
     o: parseFloat(v.open),
     h: parseFloat(v.high),
     l: parseFloat(v.low),
@@ -84,12 +87,28 @@ async function fetchCandle(symbol, interval, size) {
   })).reverse();
 }
 
-function fmtC(candles, label) {
-  let out = label + '\n';
-  candles.slice(-8).forEach((c, i) => {
-    out += `${i + 1} O:${c.o.toFixed(5)} H:${c.h.toFixed(5)} L:${c.l.toFixed(5)} C:${c.c.toFixed(5)}\n`;
-  });
-  return out;
+function summarizeCandles(candles) {
+  const first = candles[0];
+  const last = candles[candles.length - 1];
+  const high = Math.max(...candles.map(c => c.h));
+  const low = Math.min(...candles.map(c => c.l));
+  const body = last.c - first.o;
+  const pct = first.o ? ((last.c - first.o) / first.o) * 100 : 0;
+  return {
+    count: candles.length,
+    open: first.o,
+    close: last.c,
+    high,
+    low,
+    body,
+    pct,
+    direction: body > 0 ? 'BULLISH' : body < 0 ? 'BEARISH' : 'SIDEWAYS'
+  };
+}
+
+function formatCompactCandles(candles, label) {
+  const rows = candles.slice(-12).map((c, i) => `${i + 1}. O:${c.o.toFixed(5)} H:${c.h.toFixed(5)} L:${c.l.toFixed(5)} C:${c.c.toFixed(5)}`).join('\n');
+  return `${label}\n${rows}`;
 }
 
 function parseFirstJson(raw) {
@@ -104,11 +123,10 @@ function postOpenAI(messages) {
     const body = JSON.stringify({
       model: OPENAI_MODEL,
       messages,
-      max_tokens: 320,
-      temperature: 0.25,
+      max_tokens: 420,
+      temperature: 0.2,
       response_format: { type: 'json_object' }
     });
-
     const urlObj = new URL(OPENAI_URL);
     const options = {
       hostname: urlObj.hostname,
@@ -122,19 +140,14 @@ function postOpenAI(messages) {
       },
       timeout: 20000
     };
-
     const req = https.request(options, (r) => {
       let data = '';
       r.on('data', chunk => data += chunk);
       r.on('end', () => {
-        try {
-          resolve(JSON.parse(data));
-        } catch (e) {
-          reject(e);
-        }
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(e); }
       });
     });
-
     req.on('error', reject);
     req.on('timeout', () => req.destroy(new Error('GPT timeout')));
     req.write(body);
@@ -142,8 +155,73 @@ function postOpenAI(messages) {
   });
 }
 
+async function getMarketSnapshot(symbol) {
+  const key = String(symbol || 'EUR/USD').trim().toUpperCase();
+  const cached = marketCache.get(key);
+  if (cached && (Date.now() - cached.createdAt < CACHE_TTL_MS)) return cached.payload;
+
+  const [c1m, c5m, c15m] = await Promise.all([
+    fetchCandle(key, '1min', SNAPSHOT_CANDLES),
+    fetchCandle(key, '5min', SNAPSHOT_CANDLES),
+    fetchCandle(key, '15min', SNAPSHOT_CANDLES)
+  ]);
+
+  const payload = {
+    symbol: key,
+    candles: { '1m': c1m, '5m': c5m, '15m': c15m },
+    summary: { '1m': summarizeCandles(c1m), '5m': summarizeCandles(c5m), '15m': summarizeCandles(c15m) },
+    createdAt: Date.now()
+  };
+
+  marketCache.set(key, { createdAt: Date.now(), payload });
+  return payload;
+}
+
+function normalizeDecision(gpt, now, minStr, expMin, expMax, previous) {
+  const out = {};
+  out.status = ['OPEN', 'WAIT_CONFIRM', 'HOLD'].includes(String(gpt.status || '').toUpperCase()) ? String(gpt.status).toUpperCase() : 'HOLD';
+  out.signal = ['BUY', 'SELL', 'HOLD'].includes(String(gpt.signal || '').toUpperCase()) ? String(gpt.signal).toUpperCase() : 'HOLD';
+  out.confidence = Math.max(0, Math.min(100, parseInt(gpt.confidence || 0, 10) || 0));
+  out.trend15m = String(gpt.trend15m || 'SIDEWAYS').toUpperCase();
+  out.smartmoney = !!gpt.smartmoney;
+  out.expiry = String(gpt.expiry || '').trim();
+  out.reasonopen = String(gpt.reasonopen || 'Analisa server');
+  out.reasonexpiry = String(gpt.reasonexpiry || 'Expiry disesuaikan dengan kualitas setup');
+  out.confirm_required = out.status === 'WAIT_CONFIRM';
+  out.confirm_rule = String(gpt.confirm_rule || (out.confirm_required ? 'Tunggu candle konfirmasi searah' : 'Tidak perlu konfirmasi tambahan'));
+  out.next_check_in_sec = out.confirm_required ? 180 : 0;
+  out.entryprice = Number(gpt.entryprice || 0);
+  out.server_note = 'server-first 3m analysis';
+
+  const diffMin = diffMinutesFrom(now, out.expiry);
+  if (!/^\d{2}:\d{2}$/.test(out.expiry) || diffMin == null || diffMin < expMin || diffMin > expMax) {
+    out.expiry = minStr;
+    out.reasonexpiry += ' [server-adjusted]';
+  }
+
+  if (out.signal !== 'HOLD' && out.confidence < 60) {
+    out.status = 'HOLD';
+    out.signal = 'HOLD';
+    out.confirm_required = false;
+    out.reasonopen = 'Confidence terlalu rendah, ditahan oleh server';
+  }
+
+  if (out.status === 'OPEN' && out.signal === 'HOLD') out.status = 'HOLD';
+  if (out.status === 'WAIT_CONFIRM' && out.signal === 'HOLD') out.signal = previous?.signal && previous.signal !== 'HOLD' ? previous.signal : 'BUY';
+  if (out.status === 'HOLD') out.confirm_required = false;
+
+  return out;
+}
+
 app.get('/health', (req, res) => {
-  res.json({ ok: true, message: 'AVS Bot Server aktif', time: new Date().toISOString(), userCount: Object.keys(users).length });
+  res.json({
+    ok: true,
+    message: 'AVS Bot Server aktif',
+    time: new Date().toISOString(),
+    userCount: Object.keys(users).length,
+    analysisCooldownSec: ANALYSIS_COOLDOWN_MS / 1000,
+    snapshotCandles: SNAPSHOT_CANDLES
+  });
 });
 
 app.post('/auth/login', async (req, res) => {
@@ -211,23 +289,31 @@ app.post('/bot/signal', async (req, res) => {
 
     const user = users[decoded.username];
     if (!user || !user.is_active) return res.json({ ok: false, error: 'Akun tidak aktif' });
-
     resetIfNewDay(user);
     const limit = PLAN_LIMIT[user.plan] || 5;
     if (user.usage_today >= limit) {
       return res.json({ ok: false, error: `Limit harian habis! (${user.usage_today}/${limit}). Reset besok jam 00:00.`, usage: user.usage_today, limit });
     }
 
-    const sym = String(symbol || 'EUR/USD').trim();
-    const expMin = Math.max(1, parseInt(expirymin || 5, 10));
+    const sym = String(symbol || 'EUR/USD').trim().toUpperCase();
+    const expMin = Math.max(3, parseInt(expirymin || 5, 10));
     const expMax = Math.max(expMin, parseInt(expirymax || 30, 10));
+    const stateKey = `${decoded.username}::${sym}`;
+    const prev = analysisState.get(stateKey);
 
-    const [c1m, c5m, c15m] = await Promise.all([
-      fetchCandle(sym, '1min', 18),
-      fetchCandle(sym, '5min', 18),
-      fetchCandle(sym, '15min', 18)
-    ]);
+    if (prev && (Date.now() - prev.createdAt < ANALYSIS_COOLDOWN_MS)) {
+      return res.json({
+        ok: true,
+        signal: prev.signal,
+        usage: user.usage_today,
+        limit,
+        remaining: limit - user.usage_today,
+        cached: true,
+        nextAnalysisInSec: Math.ceil((ANALYSIS_COOLDOWN_MS - (Date.now() - prev.createdAt)) / 1000)
+      });
+    }
 
+    const snapshot = await getMarketSnapshot(sym);
     const now = new Date();
     const baseMin = new Date(Math.ceil(now.getTime() / 60000) * 60000);
     const minExpiryDate = new Date(baseMin.getTime() + expMin * 60000);
@@ -235,10 +321,18 @@ app.post('/bot/signal', async (req, res) => {
     const minStr = hhmm(minExpiryDate);
     const maxStr = hhmm(maxExpiryDate);
     const nowStr = now.toLocaleTimeString('id-ID', { hour12: false });
-    const data = fmtC(c15m, 'TF 15m') + fmtC(c5m, 'TF 5m') + fmtC(c1m, 'TF 1m');
 
-    const sysMsg = 'You are a binary options trading signal AI. Always respond with valid JSON only. Allowed signal values: BUY, SELL, HOLD. Use HOLD if market is choppy, late, unclear, weak, or low quality. Required keys: signal, confidence, trend15m, smartmoney, expiry, reasonopen, reasonexpiry, entryprice.';
-    const userMsg = `Data ${sym} jam WIB ${nowStr}:\n${data}\nCari setup selektif. Expiry harus antara ${minStr} sampai ${maxStr} (HH:MM WIB, menit bulat). Jangan paksa entry. Jika market chop, telat, atau struktur tidak clean, pilih HOLD. Balas HANYA JSON: {"signal":"HOLD","confidence":65,"trend15m":"BULLISH","smartmoney":true,"expiry":"${minStr}","reasonopen":"setup belum clean","reasonexpiry":"menunggu momentum lebih valid","entryprice":1.15780}`;
+    const compactData = [
+      formatCompactCandles(snapshot.candles['15m'], 'TF 15m'),
+      formatCompactCandles(snapshot.candles['5m'], 'TF 5m'),
+      formatCompactCandles(snapshot.candles['1m'], 'TF 1m')
+    ].join('\n\n');
+
+    const summaryText = JSON.stringify(snapshot.summary);
+    const previousText = prev ? JSON.stringify({ signal: prev.signal.signal, status: prev.signal.status, confidence: prev.signal.confidence }) : 'none';
+
+    const sysMsg = 'You are a professional binary options signal engine. Return valid JSON only. Required keys: status, signal, confidence, trend15m, smartmoney, expiry, reasonopen, reasonexpiry, confirm_rule, entryprice. Allowed status: OPEN, WAIT_CONFIRM, HOLD. Allowed signal: BUY, SELL, HOLD. Use WAIT_CONFIRM when direction exists but needs one more confirmation step. Use HOLD if market is choppy, late, unclear, weak, or low quality.';
+    const userMsg = `Data ${sym} jam WIB ${nowStr}. Snapshot memakai 30 candle per timeframe. Summary: ${summaryText}. Previous decision: ${previousText}.\n\n${compactData}\n\nTentukan keputusan profesional. Expiry harus antara ${minStr} sampai ${maxStr} HH:MM WIB. Jangan paksa entry. Jika setup ada arah tapi belum matang, pakai WAIT_CONFIRM. Jika jelek, pakai HOLD. Balas HANYA JSON.`;
 
     const gptResult = await postOpenAI([
       { role: 'system', content: sysMsg },
@@ -249,28 +343,33 @@ app.post('/bot/signal', async (req, res) => {
     if (!raw) throw new Error('Respons GPT kosong');
 
     const gpt = parseFirstJson(raw);
-    gpt.signal = ['BUY', 'SELL', 'HOLD'].includes(String(gpt.signal || '').toUpperCase()) ? String(gpt.signal).toUpperCase() : 'HOLD';
-    gpt.confidence = Math.max(0, Math.min(100, parseInt(gpt.confidence || 0, 10) || 0));
-    gpt.trend15m = String(gpt.trend15m || 'SIDEWAYS').toUpperCase();
-    gpt.smartmoney = !!gpt.smartmoney;
-    gpt.reasonopen = String(gpt.reasonopen || 'Analisa server');
-    gpt.reasonexpiry = String(gpt.reasonexpiry || 'Expiry disesuaikan dengan kualitas setup');
-    gpt.entryprice = Number(gpt.entryprice || c1m[c1m.length - 1].c || 0);
-
-    const gpExp = String(gpt.expiry || '').trim();
-    const diffMin = diffMinutesFrom(now, gpExp);
-    if (!/^\d{2}:\d{2}$/.test(gpExp) || diffMin == null || diffMin < expMin || diffMin > expMax) {
-      gpt.expiry = minStr;
-      gpt.reasonexpiry += ' [server-adjusted]';
-    }
-
-    if (gpt.signal !== 'HOLD' && gpt.confidence < 60) {
-      gpt.signal = 'HOLD';
-      gpt.reasonopen = 'Confidence terlalu rendah, ditahan oleh server';
+    const normalized = normalizeDecision(gpt, now, minStr, expMin, expMax, prev?.signal);
+    if (!normalized.entryprice) {
+      normalized.entryprice = Number(snapshot.candles['1m'][snapshot.candles['1m'].length - 1].c || 0);
     }
 
     user.usage_today++;
-    res.json({ ok: true, signal: gpt, usage: user.usage_today, limit, remaining: limit - user.usage_today });
+    analysisState.set(stateKey, {
+      createdAt: Date.now(),
+      signal: normalized,
+      symbol: sym,
+      snapshotSummary: snapshot.summary
+    });
+
+    res.json({
+      ok: true,
+      signal: normalized,
+      usage: user.usage_today,
+      limit,
+      remaining: limit - user.usage_today,
+      cached: false,
+      nextAnalysisInSec: ANALYSIS_COOLDOWN_MS / 1000,
+      snapshotMeta: {
+        symbol: sym,
+        candlesPerTf: SNAPSHOT_CANDLES,
+        timeframes: ['1m', '5m', '15m']
+      }
+    });
   } catch (e) {
     console.error('/bot/signal error:', e.message);
     res.json({ ok: false, error: 'Gagal ambil sinyal: ' + e.message });
@@ -300,7 +399,7 @@ app.post('/admin/create-user', adminAuth, async (req, res) => {
       last_reset: new Date().toDateString(),
       created_at: new Date().toISOString()
     };
-    res.json({ ok: true, message: `User \"${username}\" [${users[username].plan.toUpperCase()}] berhasil dibuat!` });
+    res.json({ ok: true, message: `User "${username}" [${users[username].plan.toUpperCase()}] berhasil dibuat!` });
   } catch (e) {
     res.json({ ok: false, error: e.message });
   }
@@ -349,10 +448,11 @@ app.delete('/admin/delete-user', adminAuth, (req, res) => {
 });
 
 app.use((req, res) => {
-  res.status(404).json({ ok: false, error: `Endpoint \"${req.method} ${req.path}\" tidak ditemukan` });
+  res.status(404).json({ ok: false, error: `Endpoint "${req.method} ${req.path}" tidak ditemukan` });
 });
 
 app.listen(PORT, () => {
   console.log(`AVS Bot Server jalan di port ${PORT}`);
   console.log(`Admin password: ${ADMIN_PASSWORD}`);
+  console.log(`Analysis cooldown: ${ANALYSIS_COOLDOWN_MS / 1000}s | Snapshot candles: ${SNAPSHOT_CANDLES}`);
 });
