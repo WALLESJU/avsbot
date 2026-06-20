@@ -22,7 +22,7 @@ let users = {};
 // selama TTL belum habis. GPT + TwelveData hanya dipanggil saat stale.
 // TODO: Ganti dengan Redis agar persist saat Railway restart.
 const pairBox = {};
-const BOX_TTL = 3 * 60 * 1000; // 3 menit TTL per pair
+const BOX_TTL = parseInt(process.env.BOX_TTL_MIN || '3') * 60 * 1000; // default 3 menit, ubah via env BOX_TTL_MIN
 
 function boxFresh(sym) {
   const b = pairBox[sym];
@@ -38,7 +38,12 @@ function resetIfNewDay(user) {
   }
 }
 
-const PLAN_LIMIT = { free: 10, pro: 30 };
+// Ubah limit via env: LIMIT_FREE dan LIMIT_PRO (Railway → Variables)
+// Atau via endpoint /admin/set-plan-limit saat runtime
+let PLAN_LIMIT = {
+  free: parseInt(process.env.LIMIT_FREE || '10'),
+  pro:  parseInt(process.env.LIMIT_PRO  || '30')
+};
 
 // ── MIDDLEWARE ADMIN AUTH ────────────────────────────────────────
 function adminAuth(req, res, next) {
@@ -340,6 +345,42 @@ app.delete('/admin/delete-user', adminAuth, (req, res) => {
   res.json({ ok: true, message: `User ${username} dihapus` });
 });
 
+// ── ADMIN GPT CONFIG ENDPOINTS [v5.0] ────────────────────────────
+
+// Ubah limit harian FREE dan PRO saat runtime (tanpa redeploy)
+// PATCH /admin/set-plan-limit  body: { free: 15, pro: 50 }
+app.patch('/admin/set-plan-limit', adminAuth, (req, res) => {
+  const { free, pro } = req.body;
+  if (free !== undefined) {
+    const n = parseInt(free);
+    if (isNaN(n) || n < 1) return res.json({ ok: false, error: 'Nilai free tidak valid' });
+    PLAN_LIMIT.free = n;
+  }
+  if (pro !== undefined) {
+    const n = parseInt(pro);
+    if (isNaN(n) || n < 1) return res.json({ ok: false, error: 'Nilai pro tidak valid' });
+    PLAN_LIMIT.pro = n;
+  }
+  res.json({ ok: true, message: 'Limit berhasil diupdate', plan_limit: PLAN_LIMIT });
+});
+
+// Lihat status pair box cache saat ini
+// GET /admin/box-status
+app.get('/admin/box-status', adminAuth, (req, res) => {
+  const now    = Date.now();
+  const ttlSec = BOX_TTL / 1000;
+  const boxes  = Object.entries(pairBox).map(([sym, b]) => ({
+    symbol:      sym,
+    signal:      b.data.signal,
+    confidence:  b.data.confidence,
+    age_sec:     Math.round((now - b.ts) / 1000),
+    ttl_sec:     ttlSec,
+    fresh:       boxFresh(sym),
+    expires_in:  Math.max(0, Math.round((b.ts + BOX_TTL - now) / 1000)) + 's'
+  }));
+  res.json({ ok: true, box_ttl_sec: ttlSec, plan_limit: PLAN_LIMIT, boxes });
+});
+
 // ── 404 HANDLER ──────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: `Endpoint "${req.method} ${req.path}" tidak ditemukan` });
@@ -348,4 +389,6 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ AVS Bot Server jalan di port ${PORT}`);
   console.log(`🔑 Admin password: ${ADMIN_PASSWORD}`);
+  console.log(`📊 Plan limit — FREE: ${PLAN_LIMIT.free} | PRO: ${PLAN_LIMIT.pro}`);
+  console.log(`⏱  Box TTL: ${BOX_TTL / 1000}s (env BOX_TTL_MIN=${process.env.BOX_TTL_MIN || '3'})`);
 });
